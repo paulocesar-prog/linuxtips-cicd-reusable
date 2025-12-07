@@ -1,4 +1,4 @@
-name: Workflow de Continuous Delivery
+name: Workflow de Continuous Integration
 
 on: 
   workflow_call:
@@ -11,21 +11,17 @@ on:
         description: "Região AWS"
         type: string
         default: "us-east-1"
-      deploy-type:
-        description: "Tipo de Recurso (ECS ou EKS)"
-        type: string
-        default: "ecs"
     secrets:
       AWS_ROLE_TO_ASSUME:
         description: "Role AWS para OIDC"
         required: true
-      COSIGN_KEY_PUB:
+      COSIGN_KEY:
         description: "cosign.key em Base64"
         required: true
       COSIGN_PASSWORD:
         description: "Senha da cosign.key"
-        required: true
-        
+        required: false
+
 permissions:
   id-token: write
   contents: read
@@ -35,13 +31,28 @@ env:
   AWS_REGION: ${{ inputs.aws-region }}
 
 jobs:
-  ecs-deploy:
-    if: ${{ inputs.deploy-type == 'ecs' }}
+  build-scan-dockerfile:
     runs-on: ubuntu-latest
 
     steps:
       - name: "Checkout"
         uses: actions/checkout@v4
+
+      - name: "Dockerfile Lint (Hadolint)"
+        id: hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: ${{ env.WORKDIR }}/Dockerfile
+          no-fail: true
+          output-file: ${{ env.WORKDIR }}/lint-report.txt
+
+      - name: "Upload lint-report.txt"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-report
+          path: ${{ env.WORKDIR }}/lint-report.txt
+          retention-days: 30
 
       - name: Configurar credenciais AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -53,6 +64,9 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      - name: "Set up Docker Buildx"
+        uses: docker/setup-buildx-action@v3
+
       - name: "Compila nome do repo"
         id: compile
         run: |
@@ -60,48 +74,58 @@ jobs:
           FULL_IMAGE="$( echo "${REGISTRY}/${{ vars.IMAGE_NAME }}:${{ github.sha }}" | tr '[:upper:]' '[:lower:]' )"
           echo "full_image=${FULL_IMAGE}" >> "$GITHUB_OUTPUT"
 
+      - name: "Build da imagem"
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.WORKDIR }}
+          push: false
+          load: true
+          tags: ${{ steps.compile.outputs.full_image }}
+
+      - name: "Trivy - Scan"
+        id: trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.compile.outputs.full_image }}
+          format: 'table'
+          output: ${{ env.WORKDIR }}/trivy-report.txt
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'HIGH,CRITICAL'
+
+      - name: "Upload trivy-report.txt"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: ${{ env.WORKDIR }}/trivy-report.txt
+          retention-days: 30
+
+      - name: "Push image to ECR"
+        id: push-ecr
+        if: ${{ steps.trivy.outcome == 'success' }}
+        run: |
+          docker push "${{ steps.compile.outputs.full_image }}"
+
       - name: "Install Cosign"
+        if: ${{ steps.trivy.outcome == 'success' && steps.push-ecr.outcome == 'success' }}
         uses: sigstore/cosign-installer@v3.4.0
 
-      - name: Prepare Cosign public key
+      - name: "Prepare Cosign key"
+        if: ${{ steps.trivy.outcome == 'success' && steps.push-ecr.outcome == 'success' }}
         run: |
-          PUB_PATH="${{ inputs.working-directory }}/cosign.pub"
-          echo "${{ secrets.COSIGN_KEY_PUB }}" | base64 -d > "$PUB_PATH"
-          chmod 644 "$PUB_PATH"
-          echo "COSIGN_PUB_PATH=$PUB_PATH" >> "$GITHUB_ENV"
+          KEY_PATH="${GITHUB_WORKSPACE}/${{ env.WORKDIR }}/cosign.key"
+          mkdir -p "$(dirname "$KEY_PATH")"
+          echo "${{ secrets.COSIGN_KEY }}" | base64 -d > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+          echo "COSIGN_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
 
-      - name: Cosign - Verify signature
-        id: verify-signature
+      - name: "Cosign - Sign image"
+        if: ${{ steps.trivy.outcome == 'success' && steps.push-ecr.outcome == 'success' }}
+        env:
+          COSIGN_EXPERIMENTAL: "false"
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
         run: |
           cosign version
-          cosign verify --key "${COSIGN_PUB_PATH}" --insecure-ignore-tlog "${{ steps.compile.outputs.full_image }}"
-
-      - name: Get Task Definition
-        run: |
-          aws ecs describe-task-definition --task-definition ${{ vars.TASK_NAME }} --query taskDefinition > task-definition.json
-          echo $(cat task-definition.json | jq 'del(
-                  .taskDefinitionArn,
-                  .requiresAttributes,
-                  .compatibilities,
-                  .revision,
-                  .status,
-                  .registeredAt,
-                  .registeredBy
-             )') > task-definition.json
-
-      - name: Render Task Definition
-        id: render
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
-        with:
-          task-definition: task-definition.json
-          container-name: ${{ vars.CONTAINER_NAME }}
-          image: ${{ steps.compile.outputs.full_image }}
-
-      - name: Deploy to Amazon ECS
-        if: ${{ steps.verify-signature.outcome == 'success' }}
-        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
-        with:
-          task-definition: ${{ steps.render.outputs.task-definition }}
-          service: ${{ vars.SERVICE_NAME }}
-          cluster: ${{ vars.CLUSTER_NAME }}
-          wait-for-service-stability: true
+          cosign sign --key "${COSIGN_KEY_PATH}" "${{ steps.compile.outputs.full_image }}"

@@ -1,0 +1,125 @@
+name: Workflow de Continuous Delivery
+
+on: 
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Diretório da app (Dockerfile, relatórios etc.)"
+        type: string
+        default: "app"
+      aws-region:
+        description: "Região AWS"
+        type: string
+        default: "us-east-1"
+      deploy-type:
+        description: "Tipo de Recurso (ECS ou EKS)"
+        type: string
+        default: "ecs"
+    secrets:
+      AWS_ROLE_TO_ASSUME:
+        description: "Role AWS para OIDC"
+        required: true
+      COSIGN_KEY_PUB:
+        description: "cosign.key em Base64"
+        required: true
+      COSIGN_PASSWORD:
+        description: "Senha da cosign.key"
+        required: true
+        
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  WORKDIR: ${{ inputs.working-directory }}
+  AWS_REGION: ${{ inputs.aws-region }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      full_image: ${{ steps.compile.outputs.full_image }}
+
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciais AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: "Compila nome do repo"
+        id: compile
+        run: |
+          REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          FULL_IMAGE="$( echo "${REGISTRY}/${{ vars.IMAGE_NAME }}:${{ github.sha }}" | tr '[:upper:]' '[:lower:]' )"
+          echo "full_image=${FULL_IMAGE}" >> "$GITHUB_OUTPUT"
+
+      - name: "Install Cosign"
+        uses: sigstore/cosign-installer@v3.4.0
+
+      - name: Prepare Cosign public key
+        run: |
+          PUB_PATH="${{ inputs.working-directory }}/cosign.pub"
+          echo "${{ secrets.COSIGN_KEY_PUB }}" | base64 -d > "$PUB_PATH"
+          chmod 644 "$PUB_PATH"
+          echo "COSIGN_PUB_PATH=$PUB_PATH" >> "$GITHUB_ENV"
+
+      - name: Cosign - Verify signature
+        id: verify-signature
+        run: |
+          cosign version
+          cosign verify --key "${COSIGN_PUB_PATH}" --insecure-ignore-tlog "${{ steps.compile.outputs.full_image }}"
+          
+  ecs-deploy:
+    needs: prepare
+    if: ${{ inputs.deploy-type == 'ecs' && needs.prepare.result == 'success' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciais AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get Task Definition
+        run: |
+          aws ecs describe-task-definition --task-definition ${{ vars.TASK_NAME }} --query taskDefinition > task-definition.json
+          echo $(cat task-definition.json | jq 'del(
+                  .taskDefinitionArn,
+                  .requiresAttributes,
+                  .compatibilities,
+                  .revision,
+                  .status,
+                  .registeredAt,
+                  .registeredBy
+             )') > task-definition.json
+
+      - name: Render Task Definition
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ vars.CONTAINER_NAME }}
+          image: ${{ needs.prepare.outputs.full_image }}
+
+      - name: Deploy to Amazon ECS
+        if: ${{ needs.prepare.result == 'success' }}
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: ${{ vars.SERVICE_NAME }}
+          cluster: ${{ vars.CLUSTER_NAME }}
+          wait-for-service-stability: true
+
+  
