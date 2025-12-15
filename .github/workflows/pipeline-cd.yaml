@@ -122,4 +122,106 @@ jobs:
           cluster: ${{ vars.CLUSTER_NAME }}
           wait-for-service-stability: true
 
-  
+  eks-deploy:
+    needs: prepare
+    if: ${{ inputs.deploy-type == 'eks-kubectl' && needs.prepare.result == 'success'}}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciais AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'latest'
+
+      - name: Configure kubeconfig
+        run: |
+          aws eks update-kubeconfig --name "${{ vars.EKS_CLUSTER_NAME }}" --region "${{ env.AWS_REGION }}"
+          kubectl version --client=true
+
+      - name: Render Kubernetes manifests
+        if: ${{ needs.prepare.result == 'success' }}
+        env:
+          IMAGE: ${{ needs.prepare.outputs.full_image }}
+          NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+        run: |
+          mkdir -p k8s-rendered
+          for f in k8s/*.yaml; do
+            echo "Renderizando ${f} -> k8s-rendered/$(basename "$f")"
+            envsubst '$IMAGE $NAMESPACE' < "$f" > "k8s-rendered/$(basename "$f")"
+          done
+          echo "=== Preview do deployment renderizado ==="
+          sed -n '1,120p' k8s-rendered/deployment.yaml || true
+
+      - name: Apply Kubernetes manifests
+        if: ${{ needs.prepare.result == 'success' }}
+        run: |
+          kubectl apply -f k8s-rendered
+
+      - name: Wait rollout
+        if: ${{ needs.prepare.result == 'success' }}
+        run: |
+          set -e
+          DEPLOY=$(kubectl get deploy -n "${{ vars.K8S_NAMESPACE }}" -o name | head -n1)
+          echo "Aguardando rollout de: $DEPLOY"
+          kubectl -n "${{ vars.K8S_NAMESPACE }}" rollout status "$DEPLOY" --timeout=5m
+
+      - name: Check deployment image
+        if: ${{ needs.prepare.result == 'success' }}
+        run: |
+          echo "Imagem em execução:"
+          kubectl -n "${{ vars.K8S_NAMESPACE }}" get deploy -o jsonpath='{.items[*].spec.template.spec.containers[*].image}' || true
+          echo
+
+  eks-deploy-gitops:
+    needs: prepare
+    if: ${{ inputs.deploy-type == 'eks-argocd' && needs.prepare.result == 'success'}}
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: write
+
+    env:
+      VALUES_FILE: manifests/values.yaml
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configurar credenciais AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+
+      - name: Atualiza tag da imagem em values.yaml
+        env:
+          FULL_IMAGE: ${{ needs.prepare.outputs.full_image }}
+        run: |
+          sed -i "s|^\(.*image:[[:space:]]*\).*|\1${FULL_IMAGE}|" "$VALUES_FILE"
+
+      - name: Commit e push da alteração
+        env:
+          TARGET_BRANCH: ${{ github.ref_name }}
+        run: |
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add "$VALUES_FILE"
+          git commit -m "ci: Atualizada a image para ${{ needs.prepare.outputs.full_image }}" || echo "Nada para commitar"
+
+          git branch
+          git rev-parse --abbrev-ref HEAD
+          git push origin "$TARGET_BRANCH"
